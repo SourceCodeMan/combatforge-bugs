@@ -1,0 +1,22 @@
+name = "combatforge-bugs"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+workers_dev = true
+
+# D1 (SQLite) — fill database_id after: npx wrangler d1 create combatforge_bugs
+[[d1_databases]]
+binding = "DB"
+database_name = "combatforge_bugs"
+database_id = "68c0a96e-ab69-4dba-8ca4-ebbb69b75b2c"
+
+# Public form + API at report.playcombatforge.com (zone is on this account).
+# If the custom domain trips up the first deploy, comment this out, deploy to
+# *.workers.dev, then add the domain in the dashboard.
+routes = [
+  { pattern = "report.playcombatforge.com", custom_domain = true }
+]
+
+# Secrets (NOT stored here — set with `npx wrangler secret put <NAME>`):
+#   DISCORD_WEBHOOK_URL  — webhook for the #bug-reports channel
+#   ADMIN_KEY            — password for the /admin?key=... inbox view
+#   IP_SALT              — random string; salts the hashed IP used for rate limiting
