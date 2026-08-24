@@ -18,5 +18,5 @@ database_id = "68c0a96e-ab69-4dba-8ca4-ebbb69b75b2c"
 
 # Secrets (NOT stored here — set with `npx wrangler secret put <NAME>`):
 #   DISCORD_WEBHOOK_URL  — webhook for the #bug-reports channel
-#   ADMIN_KEY            — password for the /admin?key=... inbox view
+#   ADMIN_KEY            — password used to mint the short-lived /admin session cookie
 #   IP_SALT              — random string; salts the hashed IP used for rate limiting

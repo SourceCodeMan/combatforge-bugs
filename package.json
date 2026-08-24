@@ -2,12 +2,18 @@
   "name": "combatforge-bugs",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "schema": "wrangler d1 execute combatforge_bugs --remote --file=./schema.sql"
+    "schema": "wrangler d1 execute combatforge_bugs --remote --file=./schema.sql",
+    "migrate:privacy": "wrangler d1 execute combatforge_bugs --remote --file=./migrations/2026-08-24-privacy-hardening.sql",
+    "check": "node --check src/index.js",
+    "smoke": "node scripts/smoke.mjs",
+    "ci:worker": "bash scripts/ci-worker-smoke.sh",
+    "test": "npm run check && node scripts/ci-check.mjs && python3 scripts/ci-schema-check.py"
   },
   "devDependencies": {
-    "wrangler": "^4.111.0"
+    "wrangler": "^4.114.0"
   }
 }
