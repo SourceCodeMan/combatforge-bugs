@@ -1,17 +1,18 @@
 /**
  * CombatForge — Bug Report Worker
  * Serves a styled bug-report form, stores each submission in D1, and posts it to
- * a Discord webhook (#bug-reports). Also a private /admin?key=... inbox view.
+ * a Discord webhook (#bug-reports). The private inbox uses a short-lived, HttpOnly
+ * admin session; the administrator secret never appears in a URL.
  *
  * Bindings:  DB (D1)
  * Secrets:   DISCORD_WEBHOOK_URL, ADMIN_KEY, IP_SALT
  */
 
-const VERSION_DEFAULT = "0.1.0-alpha.1";
+const VERSION_DEFAULT = "0.1.0-alpha.19";
 const SEVERITIES = ["Low", "Medium", "High", "Crash"];
 const LIMITS = {
   summary: 200, steps: 4000, expected: 1000, actual: 2000,
-  version: 40, platform: 40, severity: 20, media_url: 500, contact: 120,
+  version: 40, platform: 40, severity: 20, media_url: 500,
 };
 
 export default {
@@ -21,8 +22,17 @@ export default {
     try {
       if (request.method === "GET" && p === "/") return htmlResponse(renderForm());
       if (request.method === "POST" && p === "/submit") return await handleSubmit(request, env, ctx);
+      if (request.method === "GET" && p === "/admin/login") return htmlResponse(renderAdminLogin());
+      if (request.method === "POST" && p === "/admin/login") return await handleAdminLogin(request, env);
+      if (request.method === "POST" && p === "/admin/logout") return handleAdminLogout();
       if (request.method === "GET" && p === "/admin") return await handleAdmin(request, env);
-      if (request.method === "GET" && p === "/health") return new Response("ok");
+      if (request.method === "GET" && p === "/health") {
+        const configured = !!(env.DB && env.IP_SALT && env.ADMIN_KEY && env.DISCORD_WEBHOOK_URL);
+        return new Response(JSON.stringify({ ok: configured }), {
+          status: configured ? 200 : 503,
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
+        });
+      }
       return new Response("Not found", { status: 404 });
     } catch (_) {
       return new Response("Server error", { status: 500 });
@@ -52,12 +62,21 @@ function htmlResponse(body, status = 200) {
       "referrer-policy": "no-referrer",
       "x-frame-options": "DENY",
       "cache-control": "no-store",
+      "content-security-policy": "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'none'; style-src 'unsafe-inline'",
+      "permissions-policy": "camera=(), geolocation=(), microphone=()",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
     },
   });
 }
 async function sha256Hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 function safeEqual(a, b) {
   a = String(a); b = String(b);
@@ -66,10 +85,40 @@ function safeEqual(a, b) {
   for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return out === 0;
 }
-function isHttpUrl(s) {
+function isAllowedMediaUrl(s) {
   if (!s) return true; // optional field
-  try { const u = new URL(s); return u.protocol === "http:" || u.protocol === "https:"; }
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "https:") return false;
+    const host = u.hostname.toLowerCase();
+    return [
+      "youtube.com", "www.youtube.com", "youtu.be", "imgur.com", "i.imgur.com",
+      "streamable.com", "www.streamable.com", "cdn.discordapp.com", "media.discordapp.net",
+    ].includes(host);
+  }
   catch { return false; }
+}
+
+function cookieValue(request, name) {
+  const cookies = request.headers.get("cookie") || "";
+  for (const part of cookies.split(";")) {
+    const at = part.indexOf("=");
+    if (at > 0 && part.slice(0, at).trim() === name) {
+      try { return decodeURIComponent(part.slice(at + 1).trim()); }
+      catch { return ""; }
+    }
+  }
+  return "";
+}
+
+async function validAdminSession(request, env) {
+  if (!env.ADMIN_KEY) return false;
+  const token = cookieValue(request, "cf_admin");
+  const [issuedRaw, signature, extra] = token.split(".");
+  const issued = Number(issuedRaw);
+  const now = Math.floor(Date.now() / 1000);
+  if (extra !== undefined || !Number.isInteger(issued) || issued > now + 60 || now - issued > 3600) return false;
+  return safeEqual(signature, await hmacHex(env.ADMIN_KEY, `combatforge-admin:${issued}`));
 }
 // Neutralize Discord markdown so reporter text can't inject masked links / formatting.
 function mdEsc(s) {
@@ -125,40 +174,56 @@ async function handleSubmit(request, env, ctx) {
     platform: clamp(form.get("platform"), LIMITS.platform) || "Windows",
     severity: clamp(form.get("severity"), LIMITS.severity),
     media_url: clamp(form.get("media_url"), LIMITS.media_url),
-    contact: clamp(form.get("contact"), LIMITS.contact),
   };
   if (!d.summary) return htmlResponse(renderError("Please add a short summary of the bug."), 400);
   if (!SEVERITIES.includes(d.severity)) d.severity = "Medium";
-  if (!isHttpUrl(d.media_url)) d.media_url = "";
+  if (!isAllowedMediaUrl(d.media_url)) {
+    return htmlResponse(renderError("Use an HTTPS YouTube, Imgur, Streamable, or Discord media link."), 400);
+  }
 
-  const ip = request.headers.get("CF-Connecting-IP") || "";
-  // Fail closed: with no salt configured, store NO hash rather than a reversible one.
-  const ipHash = (ip && env.IP_SALT) ? await sha256Hex(ip + "|" + env.IP_SALT) : "";
-  const ua = clamp(request.headers.get("user-agent"), 300);
-
-  const cols = "summary, steps, expected, actual, version, platform, severity, media_url, contact, ip_hash, user_agent";
-  const vals = [d.summary, d.steps, d.expected, d.actual, d.version, d.platform, d.severity, d.media_url, d.contact, ipHash, ua];
+  const host = new URL(request.url).hostname;
+  const ip = request.headers.get("CF-Connecting-IP") ||
+    (["127.0.0.1", "localhost"].includes(host) ? "local-dev" : "");
+  // Abuse protection is required, not optional. A production deployment missing its salt or
+  // Cloudflare client-IP header refuses submissions instead of silently disabling rate limiting.
+  if (!ip || !env.IP_SALT) {
+    console.error("bug reporter rate-limit configuration missing");
+    return htmlResponse(renderError("Reporting is temporarily unavailable. Please try again later."), 503);
+  }
+  const ipHash = await sha256Hex(ip + "|" + env.IP_SALT);
+  const windowStart = Math.floor(Date.now() / 300000) * 300000;
+  const nonce = crypto.randomUUID();
 
   let id = null;
   try {
-    let res;
-    if (ipHash) {
-      // Atomic insert-if-under-limit — no check-then-insert race. Max 5 per hashed IP / 5 min.
-      res = await env.DB.prepare(
-        `INSERT INTO bugs (${cols})
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE (SELECT COUNT(*) FROM bugs WHERE ip_hash = ? AND created_at > datetime('now','-5 minutes')) < 5`
-      ).bind(...vals, ipHash).run();
-      if (!res.meta || res.meta.changes === 0) {
-        return htmlResponse(renderError("Whoa — too many reports at once. Give it a few minutes and try again."), 429);
-      }
-    } else {
-      res = await env.DB.prepare(
-        `INSERT INTO bugs (${cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(...vals).run();
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO bug_rate_limits (ip_hash, window_start, count, last_nonce)
+         VALUES (?, ?, 1, ?)
+         ON CONFLICT(ip_hash, window_start) DO UPDATE SET
+           count = count + 1, last_nonce = excluded.last_nonce
+         WHERE bug_rate_limits.count < 5`)
+        .bind(ipHash, windowStart, nonce),
+      env.DB.prepare(
+        `INSERT INTO bugs
+           (summary, steps, expected, actual, version, platform, severity, media_url,
+            contact, ip_hash, user_agent)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, '', '', ''
+         WHERE EXISTS (
+           SELECT 1 FROM bug_rate_limits
+           WHERE ip_hash = ? AND window_start = ? AND last_nonce = ?)`)
+        .bind(d.summary, d.steps, d.expected, d.actual, d.version, d.platform, d.severity,
+          d.media_url, ipHash, windowStart, nonce),
+    ]);
+    if ((results[0]?.meta?.changes ?? 0) === 0) {
+      return htmlResponse(renderError("Whoa — too many reports at once. Give it a few minutes and try again."), 429);
     }
-    id = res.meta && res.meta.last_row_id != null ? res.meta.last_row_id : null;
-  } catch (_) {
+    id = results[1]?.meta?.last_row_id ?? null;
+    // Retain only short-lived abuse counters, detached from the report itself.
+    ctx.waitUntil(env.DB.prepare(
+      `DELETE FROM bug_rate_limits WHERE window_start < ?`).bind(windowStart - 24 * 60 * 60 * 1000).run());
+  } catch (error) {
+    console.error("bug report database write failed", String(error));
     return htmlResponse(renderError("Couldn't save that — please try again in a moment."), 500);
   }
 
@@ -178,7 +243,6 @@ async function postToDiscord(webhook, id, d) {
   fields.push({ name: "Platform", value: cut(mdEsc(d.platform), 60) || "—", inline: true });
   fields.push({ name: "Severity", value: d.severity, inline: true });
   if (d.media_url) fields.push({ name: "Media", value: cut(d.media_url, 1024) });
-  if (d.contact) fields.push({ name: "Reporter", value: cut(mdEsc(d.contact), 256) });
 
   const payload = {
     username: "CombatForge Bugs",
@@ -192,29 +256,71 @@ async function postToDiscord(webhook, id, d) {
     }],
   };
   try {
-    await fetch(webhook, {
+    const response = await fetch(webhook, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
-  } catch (_) { /* swallow — the bug is already saved in D1 */ }
+    if (!response.ok) throw new Error(`Discord webhook returned ${response.status}`);
+  } catch (error) {
+    // The report is already durable in D1; surface notification failures to Worker logs/alerts.
+    console.error("Discord bug notification failed", String(error));
+  }
 }
 
 /* ---------------- admin inbox ---------------- */
-async function handleAdmin(request, env) {
-  const key = new URL(request.url).searchParams.get("key") || "";
-  if (!env.ADMIN_KEY || !safeEqual(key, env.ADMIN_KEY)) {
-    return new Response("Unauthorized", { status: 401, headers: { "cache-control": "no-store" } });
+async function handleAdminLogin(request, env) {
+  if (!env.ADMIN_KEY) return htmlResponse(renderError("Admin access is not configured."), 503);
+  const ct = (request.headers.get("content-type") || "").toLowerCase();
+  if (!ct.includes("application/x-www-form-urlencoded")) {
+    return htmlResponse(renderAdminLogin("Unexpected submission."), 415);
   }
-  let rows = [];
+  const text = await readBodyCapped(request, 4096);
+  if (text === null) return htmlResponse(renderAdminLogin("Unexpected submission."), 413);
+  const password = new URLSearchParams(text).get("password") || "";
+  if (!safeEqual(password, env.ADMIN_KEY)) {
+    return htmlResponse(renderAdminLogin("Invalid administrator password."), 401);
+  }
+  const issued = Math.floor(Date.now() / 1000);
+  const signature = await hmacHex(env.ADMIN_KEY, `combatforge-admin:${issued}`);
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location: "/admin",
+      "cache-control": "no-store",
+      "set-cookie": `cf_admin=${issued}.${signature}; Path=/admin; Max-Age=3600; HttpOnly; Secure; SameSite=Strict`,
+    },
+  });
+}
+
+function handleAdminLogout() {
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location: "/admin/login",
+      "cache-control": "no-store",
+      "set-cookie": "cf_admin=; Path=/admin; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+    },
+  });
+}
+
+async function handleAdmin(request, env) {
+  if (!await validAdminSession(request, env)) {
+    return new Response(null, {
+      status: 303,
+      headers: { location: "/admin/login", "cache-control": "no-store" },
+    });
+  }
   try {
     const q = await env.DB.prepare(
-      `SELECT id, created_at, severity, version, platform, summary, actual, media_url, contact
+      `SELECT id, created_at, severity, version, platform, summary, actual, media_url
        FROM bugs ORDER BY id DESC LIMIT 200`
     ).all();
-    rows = q.results || [];
-  } catch (_) { /* show empty table */ }
-  return htmlResponse(renderAdmin(rows));
+    return htmlResponse(renderAdmin(q.results || []));
+  } catch (error) {
+    console.error("admin inbox database read failed", String(error));
+    return htmlResponse(renderError("The inbox could not be loaded. Check the Worker logs."), 500);
+  }
 }
 
 /* ---------------- views ---------------- */
@@ -282,10 +388,11 @@ function renderForm() {
       <div><label>Version</label><input type="text" name="version" maxlength="40" value="${esc(VERSION_DEFAULT)}"></div>
       <div><label>Platform</label><input type="text" name="platform" maxlength="40" value="Windows"></div>
     </div>
-    <label>Screenshot / clip link <span class="hint">— paste a link (YouTube, Imgur, Streamable…)</span></label>
+    <label>Screenshot / clip link <span class="hint">— HTTPS YouTube, Imgur, Streamable, or Discord link</span></label>
     <input type="url" name="media_url" maxlength="500" placeholder="https://…">
-    <label>Your Discord or email <span class="hint">— optional, so we can follow up</span></label>
-    <input type="text" name="contact" maxlength="120" placeholder="@yourhandle">
+    <p class="sub" style="margin-top:18px">Do not include your name, email, passwords, account tokens,
+      or other personal information. Reports are stored for development and may be forwarded to our
+      private Discord bug channel.</p>
     <button type="submit">Submit Report</button>
   </form>`);
 }
@@ -308,6 +415,20 @@ function renderError(msg) {
   </div>`, "CombatForge — Error");
 }
 
+function renderAdminLogin(error = "") {
+  return page(`<div class="card">
+    <p class="brand">Combat<span class="f">Forge</span></p>
+    <div class="kick">Bug Inbox</div>
+    <h1>Administrator login</h1>
+    ${error ? `<p class="sub" style="color:#ff7a70">${esc(error)}</p>` : ""}
+    <form method="POST" action="/admin/login">
+      <label>Password</label>
+      <input type="password" name="password" required autocomplete="current-password">
+      <button type="submit">Open Inbox</button>
+    </form>
+  </div>`, "CombatForge — Admin Login");
+}
+
 function renderAdmin(rows) {
   const sevColor = { Low: "#8b95a2", Medium: "#ff6a1a", High: "#ff3b1a", Crash: "#ff5555" };
   const body = rows.map((r) => `<tr>
@@ -316,12 +437,12 @@ function renderAdmin(rows) {
     <td style="font-weight:700;color:${sevColor[r.severity] || "#e9edf2"}">${esc(r.severity)}</td>
     <td style="white-space:nowrap">${esc(r.version)}</td>
     <td><strong>${esc(r.summary)}</strong>${r.actual ? `<br><span style="color:#8b95a2">${esc(r.actual)}</span>` : ""}${r.media_url ? `<br><a href="${esc(r.media_url)}" target="_blank" rel="noopener noreferrer nofollow">media ↗</a>` : ""}</td>
-    <td>${esc(r.contact)}</td>
   </tr>`).join("");
   return page(`<p class="brand">Combat<span class="f">Forge</span></p>
     <div class="kick">Bug Inbox — ${rows.length} report${rows.length === 1 ? "" : "s"}</div>
+    <form method="POST" action="/admin/logout"><button type="submit">Log out</button></form>
     <div class="tablewrap"><table>
-      <thead><tr><th>#</th><th>When</th><th>Sev</th><th>Ver</th><th>Bug</th><th>By</th></tr></thead>
-      <tbody>${body || `<tr><td colspan="6" style="color:#8b95a2;padding:22px">No bugs yet.</td></tr>`}</tbody>
+      <thead><tr><th>#</th><th>When</th><th>Sev</th><th>Ver</th><th>Bug</th></tr></thead>
+      <tbody>${body || `<tr><td colspan="5" style="color:#8b95a2;padding:22px">No bugs yet.</td></tr>`}</tbody>
     </table></div>`, "CombatForge — Bug Inbox");
 }
