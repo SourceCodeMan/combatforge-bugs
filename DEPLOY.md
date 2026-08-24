@@ -12,7 +12,8 @@ No third-party tools; owned end to end.
 ## Pieces (already set up)
 - **D1 database** `combatforge_bugs` — created; id is in `wrangler.toml`. Schema in `schema.sql` (table `bugs`).
 - **Discord webhook** — "CombatForge Bugs", posting to **#bug-reports** (already created in the server).
-- **Secrets** (set at deploy time, never stored in the repo): `DISCORD_WEBHOOK_URL`, `ADMIN_KEY`, `IP_SALT`.
+- **Secrets** (set at deploy time, never stored in the repo): `DISCORD_WEBHOOK_URL`, `ADMIN_KEY`
+  (at least 32 random characters), and `IP_SALT` (at least 16 random characters).
 
 ## Deploy (first time, ~2 min)
 ```powershell
@@ -20,6 +21,7 @@ npx wrangler login      # click "Allow" in the browser
 ./deploy.ps1            # applies schema, deploys, prompts for the 3 secrets
 ```
 Enter each secret when prompted (input is hidden). Never place them in chat, source control, or a URL.
+Generate the two random values locally, for example with `openssl rand -hex 32`.
 
 ## Update later
 For this privacy-hardening release, apply the idempotent schema and scrub before deploying:

@@ -27,7 +27,8 @@ export default {
       if (request.method === "POST" && p === "/admin/logout") return handleAdminLogout();
       if (request.method === "GET" && p === "/admin") return await handleAdmin(request, env);
       if (request.method === "GET" && p === "/health") {
-        const configured = !!(env.DB && env.IP_SALT && env.ADMIN_KEY && env.DISCORD_WEBHOOK_URL);
+        const configured = !!(env.DB && env.IP_SALT?.length >= 16 && env.ADMIN_KEY?.length >= 32 &&
+          env.DISCORD_WEBHOOK_URL?.startsWith("https://"));
         return new Response(JSON.stringify({ ok: configured }), {
           status: configured ? 200 : 503,
           headers: { "content-type": "application/json", "cache-control": "no-store" },
@@ -112,7 +113,7 @@ function cookieValue(request, name) {
 }
 
 async function validAdminSession(request, env) {
-  if (!env.ADMIN_KEY) return false;
+  if (!env.ADMIN_KEY || env.ADMIN_KEY.length < 32) return false;
   const token = cookieValue(request, "cf_admin");
   const [issuedRaw, signature, extra] = token.split(".");
   const issued = Number(issuedRaw);
@@ -186,7 +187,7 @@ async function handleSubmit(request, env, ctx) {
     (["127.0.0.1", "localhost"].includes(host) ? "local-dev" : "");
   // Abuse protection is required, not optional. A production deployment missing its salt or
   // Cloudflare client-IP header refuses submissions instead of silently disabling rate limiting.
-  if (!ip || !env.IP_SALT) {
+  if (!ip || !env.IP_SALT || env.IP_SALT.length < 16) {
     console.error("bug reporter rate-limit configuration missing");
     return htmlResponse(renderError("Reporting is temporarily unavailable. Please try again later."), 503);
   }
@@ -270,7 +271,9 @@ async function postToDiscord(webhook, id, d) {
 
 /* ---------------- admin inbox ---------------- */
 async function handleAdminLogin(request, env) {
-  if (!env.ADMIN_KEY) return htmlResponse(renderError("Admin access is not configured."), 503);
+  if (!env.ADMIN_KEY || env.ADMIN_KEY.length < 32) {
+    return htmlResponse(renderError("Admin access is not securely configured."), 503);
+  }
   const ct = (request.headers.get("content-type") || "").toLowerCase();
   if (!ct.includes("application/x-www-form-urlencoded")) {
     return htmlResponse(renderAdminLogin("Unexpected submission."), 415);
