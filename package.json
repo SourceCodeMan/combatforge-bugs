@@ -8,6 +8,6 @@
     "schema": "wrangler d1 execute combatforge_bugs --remote --file=./schema.sql"
   },
   "devDependencies": {
-    "wrangler": "^4.111.0"
+    "wrangler": "^4.131.0"
   }
 }
